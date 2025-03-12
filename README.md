@@ -1,4 +1,4 @@
-# Line-Following Robot with Obstacle Detection 🚀  
+# Line-Following Robot with Obstacle Detection
 
 This project is a **PID-controlled line-following robot** using the **Mbed microcontroller**. The robot follows a black line on the ground, adjusts speed via **DIP switches**, stops when it detects an **obstacle using a TOF sensor**, and turns on an **RGB LED** to indicate its status.
 
