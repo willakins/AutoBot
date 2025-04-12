@@ -1,159 +1,315 @@
 #include "mbed.h"
-#include "SDFileSystem.h"  // To handle SD card
-#include "wave_player.h"   // Assuming you have a wave player library for sound
+#include "wave_player.h"
+#include "SDBlockDevice.h"
+#include "MyFATFileSystem.h"
 
-// Motor and sensor pin definitions
-PwmOut motorLeftSpeed(PA_0);      // Left motor speed control (PWM)
-PwmOut motorRightSpeed(PA_1);     // Right motor speed control (PWM)
-DigitalOut motorLeftDirection(PA_2); // Left motor direction control
-DigitalOut motorRightDirection(PA_3); // Right motor direction control
+/**
+*       MOTOR PINS
+*/
+PwmOut motorLeftSpeed(p25);      // Left motor speed control (PWM)
+PwmOut motorRightSpeed(p26);     // Right motor speed control (PWM)
 
-AnalogIn lineSensorLeft(PA_4);     // Left line sensor (analog)
-AnalogIn lineSensorRight(PA_5);    // Right line sensor (analog)
+DigitalOut motorLeftIn1(p22); // Left motor direction control
+DigitalOut motorLeftIn2(P2_1); // Right motor direction control
+DigitalOut motorRightIn1(p14); // Left motor direction control
+DigitalOut motorRightIn2(p13); // Right motor direction control
 
-DigitalIn button(SW2);             // Button to start/stop movement
-DigitalIn dipSwitch(D0);           // DIP switch for speed control (adjust motor voltage)
-Serial lidarSensor(D1, D0);        // LiDAR sensor for obstacle detection (RX, TX)
 
-// Speaker and SD card initialization
-PwmOut speaker(PB_0);             // Speaker control
-SDFileSystem sd(PF_0, PF_1, PF_3, PF_2, "sd"); // SD card on pins PF_0, PF_1, PF_2, PF_3
-WavePlayer wavPlayer;             // Assuming a wave player class to play .wav files
 
-// States for line following and obstacle detection
-enum RobotState { IDLE, FOLLOW_LINE, STOPPED, REVERSE, END_OF_LINE };
-RobotState currentState = IDLE;
+/**
+*       BUTTON PINS
+*/
+DigitalIn button(p30);             // Button to start/stop movement
+DigitalIn dipSwitch(p29);          // DIP switch for speed control (adjust motor voltage)
 
-// PID controller parameters
-float Kp = 0.5, Ki = 0.1, Kd = 0.05;
+
+
+/**
+*       SENSOR PINS
+*/
+DigitalOut trigger(p10);
+DigitalIn echo(p11);
+DigitalIn l1(p20);
+DigitalIn l2(p19);
+DigitalIn l3(p17);
+DigitalIn l4(p16);
+
+
+
+/**
+*       TIMERS
+*/
+Timer sonarTimer;
+Timer debounceTimer;            // Timer to handle button debounce
+
+
+
+/**
+*       STATUS PINS
+*/
+DigitalOut green(p28);
+DigitalOut red(p27);
+AnalogOut DACout(p18); //speaker
+
+
+/**
+*       FILESYSTEM SETUP
+*/
+BufferedSerial pc(USBTX, USBRX, 115200); //ls /dev/tty.* then screen /dev/tty.usbmodem102 115200
+FILE *fp = fdopen(&pc, "w");
+SDBlockDevice sd(p5, p6, p7, p8);  // MOSI, MISO, SCK, CS pins
+MyFATFileSystem fs("sd", &sd);
+wave_player wavPlayer(&DACout);
+
+
+
+/**
+*       GLOBAL VARIABLES
+*/
+#define PI 3.14159265358979323846
+#define MIN_DIST 20           // Distance for obstacle detection 20cm
+#define DEBOUNCE_DELAY 0.05   // Debounce delay in seconds 50ms
+#define THRESHOLD 0.7         // For detecting end of line
+
+volatile float dist = 0.0f;  
+bool buttonState = false;       // Current button state
+bool lastButtonState = false;   // Previous button state
+float baseSpeed = 0.5;     // Base speed for the motors
+
+float Kp = 0.5, Ki = 0.1, Kd = 0.05; // PID controller parameters
 float previous_error = 0, integral = 0;
 
-// Speed control via DIP switch
-float baseSpeed = 0.5; // Base speed for the motors (adjusted by DIP switch)
+enum RobotState { IDLE, FOLLOW_LINE, OBSTRUCTED, END }; // States for line following and obstacle detection
+RobotState currentState = IDLE;
 
-void init_motor_control() {
-    motorLeftSpeed.period_ms(20);   // PWM period for motor speed
-    motorRightSpeed.period_ms(20);  // PWM period for motor speed
-    motorLeftDirection = 0;         // Default left motor direction forward
-    motorRightDirection = 0;        // Default right motor direction forward
-}
+//Files for speaker
+string honk_wav = "/sd/honk.wav";
+string end_of_line_wav = "/sd/stop.wav";//That sound like when an applicance finishes running
 
+
+
+/**
+*
+*       MOTOR CONTROL
+*
+*/
 void set_motor_speed(float leftSpeed, float rightSpeed) {
     motorLeftSpeed = leftSpeed;
     motorRightSpeed = rightSpeed;
 }
 
-void line_following() {
-    float leftSensor = lineSensorLeft.read();  // Read line sensor value (0-1)
-    float rightSensor = lineSensorRight.read();  // Read line sensor value (0-1)
-    float error = leftSensor - rightSensor;
-
-    integral += error;
-    float derivative = error - previous_error;
-
-    float output = Kp * error + Ki * integral + Kd * derivative;
-
-    set_motor_speed(baseSpeed - output, baseSpeed + output); // Adjust motor speed based on error
-
-    previous_error = error;
-
-    // Check if we've reached the end of the line (both sensors detect white)
-    if (leftSensor > 0.7 && rightSensor > 0.7) {
-        currentState = END_OF_LINE;  // Transition to the END_OF_LINE state
-    }
-}
-
-void lidar_obstacle_detection() {
-    // Pseudo-code for reading data from LiDAR sensor
-    int distance = lidarSensor.read();  // Replace with actual LiDAR API call
-
-    if (distance < 30) { // Obstacle detected within 30 cm
-        currentState = STOPPED;
-        play_stop_sound();  // Play honk sound when stopped
-    }
-}
-
-void play_tone() {
-    speaker.period(1.0 / 1000);   // Frequency for tone (e.g., 1 kHz)
-    speaker = 0.5;                // Play tone at 50% duty cycle
-}
-
-void play_stop_sound() {
-    // Play sound from .wav file when the robot stops due to an obstacle
-    wavPlayer.play("sd:/stop_sound.wav"); // Play sound from SD card
-}
-
-void reverse() {
-    motorLeftDirection = 1; // Reverse left motor
-    motorRightDirection = 1; // Reverse right motor
-    set_motor_speed(baseSpeed, baseSpeed);
+void init_motor_control() {
+    motorLeftSpeed.period_ms(20);   // PWM period for motor speed
+    motorRightSpeed.period_ms(20);  // PWM period for motor speed
+    motorLeftIn1 = 0; // Left motor clockwise default
+    motorLeftIn2 = 1;
+    motorRightIn1 = 0; // Right motor clockwise default
+    motorRightIn2 = 1;
+    set_motor_speed(0.0f, 0.0f);
 }
 
 void stop() {
     set_motor_speed(0.0f, 0.0f); // Stop both motors
 }
 
-void play_end_of_line_tone() {
-    speaker.period(1.0 / 500);   // Frequency for end-of-line tone (e.g., 500 Hz)
-    speaker = 0.5;                // Play tone at 50% duty cycle for end of line
+void turnAround() {
+    motorLeftIn1 = 1; // Left motor counter-clockwise
+    motorLeftIn2 = 0;
+    set_motor_speed(min(baseSpeed * 2, 1), min(baseSpeed * 2, 1));
+    wait_us(680000); //Test to see how long it takes to turn 180 degrees
+    stop();
+    motorLeftIn1 = 0; // Left motor clockwise
+    motorLeftIn2 = 1;
+}
+
+float clamp(float speed) {
+    return max(0, min(1, speed)); //Ensures speeds are [0, 1]
+}
+
+
+
+
+/**
+*
+*       BUTTON CONTROL
+*
+*/
+bool checkButtonState() { // Controls button debouncing
+    if (debounceTimer.read_ms() > DEBOUNCE_DELAY * 1000) {  // Check if debounce delay has passed
+        bool currentButtonState = button.read();
+
+        // Check if the button state has changed
+        if (currentButtonState != lastButtonState) {
+            lastButtonState = currentButtonState;
+            debounceTimer.reset();  // Reset the debounce timer
+
+            if (currentButtonState == 1) {  // Button pressed
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void check_button_press() {
-    if (button) {
+    if (checkButtonState()) {
         if (currentState == IDLE) {
             currentState = FOLLOW_LINE;
         } else if (currentState == FOLLOW_LINE) {
-            currentState = REVERSE;
-        } else if (currentState == REVERSE) {
-            currentState = FOLLOW_LINE;
+            currentState = IDLE;
         }
     }
 }
 
-void adjust_speed_with_DIP() {
-    // Adjust speed based on DIP switch setting
-    if (dipSwitch) {
-        baseSpeed = 0.8;  // Increase speed if DIP switch is ON
+void check_switch() {
+    baseSpeed = dipSwitch ? 1 : 0.5;
+}
+
+
+
+/**
+*
+*       SENSOR CONTROL
+*
+*/
+float measureDistance() {
+    trigger = 1;
+    wait_us(10);
+    trigger = 0;
+    
+    while (echo == 0);
+    sonarTimer.start();
+    while (echo == 1);
+    sonarTimer.stop();
+    
+    float timeElapsed = sonarTimer.read_us();
+    sonarTimer.reset();
+    return (timeElapsed * 0.017); // Convert to cm using speed of sound
+}
+
+void detect_obstacle() {
+    if (measureDistance() < MIN_DIST) {
+        currentState = OBSTRUCTED;
+    }
+}
+
+void line_following() {
+    set_motor_speed(baseSpeed, baseSpeed);
+    float l1sensor = l1.read();  // returns (0-1)
+    float l2sensor = l2.read();
+    float l3sensor = l3.read();
+    float l4sensor = l4.read();
+
+    // Weighted error calculation, test these
+    // Negative means line is toward left, positive means right
+    float error = -3 * l1sensor - 1 * l2sensor + 1 * l3sensor + 3 * l4sensor;
+
+    integral += error;
+    float derivative = error - previous_error;
+
+    float output = Kp * error + Ki * integral + Kd * derivative;
+
+    set_motor_speed(clamp(baseSpeed - output), clamp(baseSpeed + output));
+
+    previous_error = error;
+
+    // both edge sensors see white so probably reached end of line
+    if (l1sensor > THRESHOLD && l4sensor > THRESHOLD) {
+        currentState = END;
+    }
+}
+
+
+
+/**
+*
+*       SPEAKER CONTROL
+*
+*/
+void play_sound(string filename) {
+    FILE *waveFile = fopen(filename, "r");
+    if (waveFile) {
+        wavPlayer.play(waveFile);
+        wait_us(500000);
+        fclose(waveFile);
     } else {
-        baseSpeed = 0.5;  // Default speed
+        fprintf(fp, "Could not open %s!\n", filename.c_str());
+    }
+}
+
+void play_tone(bool isHonk) {
+    float frequency = isHonk ? 300.0f : 1000.0f;  // Low for honk, high for success tone
+    float duration = 0.5f;  // Duration in seconds
+    float sample_rate = 44100.0f;
+    int samples = duration * sample_rate;
+
+    for (int i = 0; i < samples; ++i) {
+        float t = (float)i / sample_rate;
+        float value = 0.5f + 0.5f * sinf(2.0f * PI * frequency * t);  // Generate sine wave [0,1]
+        DACout.write(value);
+        wait_us(1); // Delay to prevent overload (very simple timing)
+    }
+
+    DACout.write(0.5f);  // Reset to middle
+}
+
+
+
+/**
+*
+*       MAIN CODE
+*
+*/
+void init_robot() {
+    init_motor_control();
+    debounceTimer.start(); 
+    lastButtonState = button.read();  // Set the initial state of the button
+    buttonState = lastButtonState;    // Make sure we start with the correct state
+
+    if (fs.mount() != 0) { //Mount filesystem
+        fprintf(fp, "Failed to mount SD card!\n");
+    } else {
+        fprintf(fp, "SD card mounted successfully.\n");
     }
 }
 
 int main() {
-    init_motor_control();
-    speaker = 0.0f;  // No sound initially
-
+    init_robot();
+    
     while (true) {
         check_button_press();
-        adjust_speed_with_DIP();
+        check_switch();
 
         switch (currentState) {
             case IDLE:
                 stop();
+                green = 0;
                 break;
 
             case FOLLOW_LINE:
+                detect_obstacle();
+                red = 0;
                 line_following();
-                lidar_obstacle_detection();
                 break;
 
-            case STOPPED:
+            case OBSTRUCTED:
                 stop();
-                play_stop_sound();  // Play honk sound when the robot stops due to obstacle
+                red = 1;
+                play_tone(true);
+                //play_sound(honk_wav);  // Play honk sound when stopped
+                currentState = FOLLOW_LINE;
                 break;
 
-            case REVERSE:
-                reverse();
-                lidar_obstacle_detection();
+            case END:
+                stop();
+                turnAround();
+                green = 1;
+                play_tone(false);
+                //play_sound(end_of_line_wav);  // Play tone when the end of the line is reached
+                wait_us(3000000);
+                currentState = IDLE; 
                 break;
 
-            case END_OF_LINE:
-                stop();  // Stop the robot when the end of the line is reached
-                play_end_of_line_tone();  // Play tone when the end of the line is reached
-                currentState = IDLE;  // Reset to IDLE state after reaching the end of the line
-                break;
         }
-        
-        wait_us(1000);  // Small delay to prevent excessive CPU usage
     }
 }
