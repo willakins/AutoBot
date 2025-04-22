@@ -1,7 +1,7 @@
 #include "mbed.h"
-#include "wave_player.h"
-#include "SDBlockDevice.h"
-#include "MyFATFileSystem.h"
+#include "chrono"
+#include "string"
+
 
 /**
 *       MOTOR PINS
@@ -10,7 +10,7 @@ PwmOut motorLeftSpeed(p25);      // Left motor speed control (PWM)
 PwmOut motorRightSpeed(p26);     // Right motor speed control (PWM)
 
 DigitalOut motorLeftIn1(p22); // Left motor direction control
-DigitalOut motorLeftIn2(P2_1); // Right motor direction control
+DigitalOut motorLeftIn2(p21); // Right motor direction control
 DigitalOut motorRightIn1(p14); // Left motor direction control
 DigitalOut motorRightIn2(p13); // Right motor direction control
 
@@ -20,7 +20,7 @@ DigitalOut motorRightIn2(p13); // Right motor direction control
 *       BUTTON PINS
 */
 DigitalIn button(p30);             // Button to start/stop movement
-DigitalIn dipSwitch(p29);          // DIP switch for speed control (adjust motor voltage)
+DigitalIn dipSwitch(p29);          // DIP switch for speed control 
 
 
 
@@ -29,10 +29,10 @@ DigitalIn dipSwitch(p29);          // DIP switch for speed control (adjust motor
 */
 DigitalOut trigger(p10);
 DigitalIn echo(p11);
-DigitalIn l1(p20);
-DigitalIn l2(p19);
-DigitalIn l3(p17);
-DigitalIn l4(p16);
+DigitalInOut l1(p20);
+DigitalInOut l3(p19);
+DigitalInOut l2(p17);
+DigitalInOut l4(p16);
 
 
 
@@ -41,6 +41,7 @@ DigitalIn l4(p16);
 */
 Timer sonarTimer;
 Timer debounceTimer;            // Timer to handle button debounce
+Timer sensorTimer;
 
 
 
@@ -57,9 +58,7 @@ AnalogOut DACout(p18); //speaker
 */
 BufferedSerial pc(USBTX, USBRX, 115200); //ls /dev/tty.* then screen /dev/tty.usbmodem102 115200
 FILE *fp = fdopen(&pc, "w");
-SDBlockDevice sd(p5, p6, p7, p8);  // MOSI, MISO, SCK, CS pins
-MyFATFileSystem fs("sd", &sd);
-wave_player wavPlayer(&DACout);
+
 
 
 
@@ -68,23 +67,25 @@ wave_player wavPlayer(&DACout);
 */
 #define PI 3.14159265358979323846
 #define MIN_DIST 20           // Distance for obstacle detection 20cm
-#define DEBOUNCE_DELAY 0.05   // Debounce delay in seconds 50ms
-#define THRESHOLD 0.7         // For detecting end of line
+#define DEBOUNCE_DELAY 50ms   // Debounce delay in seconds 50ms
+#define THRESHOLD 50        // For detecting end of line
+#define CONF_THRES 30       // Allows for some off-line navigation while still stopping at end of line
+#define CALIBRATION_TIME_MS 3000  // Spin for 3 seconds
+#define MAX_TIME 250        // for line sensor discharging
 
 volatile float dist = 0.0f;  
 bool buttonState = false;       // Current button state
 bool lastButtonState = false;   // Previous button state
-float baseSpeed = 0.5;     // Base speed for the motors
+float baseSpeed = 0.4;     // Base speed for the motors
 
-float Kp = 0.5, Ki = 0.1, Kd = 0.05; // PID controller parameters
+int thresholds[4];  // Calibrated thresholds per sensor
+int idleConfidence = 0;
+
+float Kp = 5.0, Ki = 0.0, Kd = 0.05; // PID controller parameters
 float previous_error = 0, integral = 0;
 
 enum RobotState { IDLE, FOLLOW_LINE, OBSTRUCTED, END }; // States for line following and obstacle detection
 RobotState currentState = IDLE;
-
-//Files for speaker
-string honk_wav = "/sd/honk.wav";
-string end_of_line_wav = "/sd/stop.wav";//That sound like when an applicance finishes running
 
 
 
@@ -115,17 +116,19 @@ void stop() {
 void turnAround() {
     motorLeftIn1 = 1; // Left motor counter-clockwise
     motorLeftIn2 = 0;
-    set_motor_speed(min(baseSpeed * 2, 1), min(baseSpeed * 2, 1));
-    wait_us(680000); //Test to see how long it takes to turn 180 degrees
-    stop();
-    motorLeftIn1 = 0; // Left motor clockwise
-    motorLeftIn2 = 1;
+
+    float speed = std::min(baseSpeed * 2.0f, 1.0f); // Clamp speed to max 1.0f
+    set_motor_speed(speed, speed);
+
+    wait_us(1000000);//wait_us(680000); // Test to see how long it takes to turn 180 degrees
+
+    init_motor_control();
+
 }
 
 float clamp(float speed) {
-    return max(0, min(1, speed)); //Ensures speeds are [0, 1]
+    return std::max(0.0f, std::min(1.0f, speed)); // Ensures speed is between 0 and 1
 }
-
 
 
 
@@ -134,8 +137,8 @@ float clamp(float speed) {
 *       BUTTON CONTROL
 *
 */
-bool checkButtonState() { // Controls button debouncing
-    if (debounceTimer.read_ms() > DEBOUNCE_DELAY * 1000) {  // Check if debounce delay has passed
+bool checkButtonState() {
+    if (debounceTimer.elapsed_time() > DEBOUNCE_DELAY) {
         bool currentButtonState = button.read();
 
         // Check if the button state has changed
@@ -143,7 +146,7 @@ bool checkButtonState() { // Controls button debouncing
             lastButtonState = currentButtonState;
             debounceTimer.reset();  // Reset the debounce timer
 
-            if (currentButtonState == 1) {  // Button pressed
+            if (currentButtonState) {  // Button pressed
                 return true;
             }
         }
@@ -162,7 +165,7 @@ void check_button_press() {
 }
 
 void check_switch() {
-    baseSpeed = dipSwitch ? 1 : 0.5;
+    baseSpeed = dipSwitch ? baseSpeed * 1.5 : baseSpeed;
 }
 
 
@@ -176,15 +179,17 @@ float measureDistance() {
     trigger = 1;
     wait_us(10);
     trigger = 0;
-    
+
     while (echo == 0);
     sonarTimer.start();
+
     while (echo == 1);
     sonarTimer.stop();
-    
-    float timeElapsed = sonarTimer.read_us();
+
+    auto timeElapsed = sonarTimer.elapsed_time();
     sonarTimer.reset();
-    return (timeElapsed * 0.017); // Convert to cm using speed of sound
+    float timeUs = std::chrono::duration_cast<std::chrono::microseconds>(timeElapsed).count();
+    return timeUs * 0.01715f;
 }
 
 void detect_obstacle() {
@@ -194,29 +199,125 @@ void detect_obstacle() {
 }
 
 void line_following() {
-    set_motor_speed(baseSpeed, baseSpeed);
-    float l1sensor = l1.read();  // returns (0-1)
-    float l2sensor = l2.read();
-    float l3sensor = l3.read();
-    float l4sensor = l4.read();
+    int s[4];
+    DigitalInOut* sensors[4] = { &l1, &l2, &l3, &l4 };
 
-    // Weighted error calculation, test these
-    // Negative means line is toward left, positive means right
-    float error = -3 * l1sensor - 1 * l2sensor + 1 * l3sensor + 3 * l4sensor;
+    // Charge all sensors
+    for (int i = 0; i < 4; i++) {
+        sensors[i]->output();
+        *(sensors[i]) = 1;
+    }
+    wait_us(10);
+
+    // Switch to input
+    for (int i = 0; i < 4; i++) {
+        sensors[i]->input();
+    }
+
+    // Measure discharge time
+    sensorTimer.reset();
+    sensorTimer.start();
+
+    for (int i = 0; i < 4; i++) {
+        while (sensors[i]->read() == 1) {
+            if (sensorTimer.elapsed_time().count() >= MAX_TIME) break;
+        }
+        s[i] = chrono::duration_cast<chrono::microseconds>(sensorTimer.elapsed_time()).count();
+    }
+
+    sensorTimer.stop();
+
+    // Normalize discharge times
+    float l1sensor = (float)s[0] / MAX_TIME;
+    float l2sensor = (float)s[1] / MAX_TIME;
+    float l3sensor = (float)s[2] / MAX_TIME;
+    float l4sensor = (float)s[3] / MAX_TIME;
+
+    // Weighted error calculation for PID
+    float error = -3 * l1sensor - 1 * l2sensor + 1 * l3sensor + 2.6 * l4sensor;
 
     integral += error;
+    integral = std::max(-1.0f, std::min(1.0f, integral));
     float derivative = error - previous_error;
 
     float output = Kp * error + Ki * integral + Kd * derivative;
+    output = std::max(-1 * baseSpeed, std::min(baseSpeed, output)); // Something here needs to be done for speed agnostic
 
     set_motor_speed(clamp(baseSpeed - output), clamp(baseSpeed + output));
-
+    printf("s0:%d, s1:%d, s2:%d, s3:%d, out:%d, confidence:%d\n", s[0], s[1], s[2], s[3], 
+    (int) output * 100, 
+    (int) idleConfidence);
     previous_error = error;
 
-    // both edge sensors see white so probably reached end of line
-    if (l1sensor > THRESHOLD && l4sensor > THRESHOLD) {
-        currentState = END;
+    if (s[1] < thresholds[0] && s[2] < thresholds[0]) {
+        idleConfidence++;
+        if (idleConfidence >= CONF_THRES) {
+            currentState = END;
+        }
+    } else {
+        idleConfidence = 0;
     }
+}
+
+void calibrate_sensors() {
+    int minVals[4] = { MAX_TIME, MAX_TIME, MAX_TIME, MAX_TIME };
+    int maxVals[4] = { 0, 0, 0, 0 };
+
+    DigitalInOut* sensors[4] = { &l1, &l2, &l3, &l4 };
+    Timer calibrationTimer;
+    calibrationTimer.start();
+
+    printf("Starting calibration...\n");
+
+    while (calibrationTimer.elapsed_time().count() < CALIBRATION_TIME_MS * 1000) {
+        // Slowly spin in place
+        set_motor_speed(-0.8f, 0.8f);
+
+        // Charge
+        for (int i = 0; i < 4; i++) {
+            sensors[i]->output();
+            *(sensors[i]) = 1;
+        }
+        wait_us(10);
+
+        // Switch to input
+        for (int i = 0; i < 4; i++) {
+            sensors[i]->input();
+        }
+
+        // Measure discharge time
+        sensorTimer.reset();
+        sensorTimer.start();
+        int readings[4];
+
+        for (int i = 0; i < 4; i++) {
+            sensorTimer.reset();
+            sensorTimer.start();
+            while (sensors[i]->read() == 1) {
+                if (sensorTimer.elapsed_time().count() >= MAX_TIME) break;
+            }
+            readings[i] = chrono::duration_cast<chrono::microseconds>(sensorTimer.elapsed_time()).count();
+        }
+        sensorTimer.stop();
+
+        // Update min/max per sensor
+        for (int i = 0; i < 4; i++) {
+            if (readings[i] < minVals[i]) minVals[i] = readings[i];
+            if (readings[i] > maxVals[i]) maxVals[i] = readings[i];
+        }
+
+        thread_sleep_for(20);
+    }
+    set_motor_speed(0, 0);
+
+    // Compute thresholds
+    for (int i = 0; i < 4; i++) {
+        thresholds[i] = minVals[i] + (maxVals[i] - minVals[i]) * 0.9f;
+        printf("Sensor %d: min=%d, max=%d, threshold=%d\n", i + 1, minVals[i], maxVals[i], thresholds[i]);
+    }
+
+    calibrationTimer.stop();
+    printf("Calibration complete.\n");
 }
 
 
@@ -226,31 +327,54 @@ void line_following() {
 *       SPEAKER CONTROL
 *
 */
-void play_sound(string filename) {
-    FILE *waveFile = fopen(filename, "r");
-    if (waveFile) {
-        wavPlayer.play(waveFile);
-        wait_us(500000);
-        fclose(waveFile);
-    } else {
-        fprintf(fp, "Could not open %s!\n", filename.c_str());
+struct Note {
+    float frequency;   // Hz
+    float duration;    // seconds
+};
+
+// Use freqeuncies to create simple sound effects. Honk is like duh - pause - duh. Success is duh, duh, duh, rising
+Note honkMelody[] = {
+    {700.0f, 0.08f},
+    {0.0f,   0.05f},
+    {700.0f, 0.1f}
+};
+
+Note successMelody[] = {
+    {1000.0f, 0.15f},
+    {1200.0f, 0.15f},
+    {1500.0f, 0.2f}
+};
+
+void play_note(float frequency, float duration, float volume = 0.5f) {
+    float sample_rate = 44100.0f;
+    int samples = duration * sample_rate;
+    
+    for (int i = 0; i < samples; ++i) {
+        float t = static_cast<float>(i) / sample_rate;
+        float wave = 0.5f + volume * sinf(2.0f * PI * frequency * t);
+        DACout.write(wave);
+        wait_us(1000000 / sample_rate);
     }
+
+    DACout.write(0.1f);
+    wait_us(20000);
 }
 
 void play_tone(bool isHonk) {
-    float frequency = isHonk ? 300.0f : 1000.0f;  // Low for honk, high for success tone
-    float duration = 0.5f;  // Duration in seconds
-    float sample_rate = 44100.0f;
-    int samples = duration * sample_rate;
+    Note* melody;
+    int length;
 
-    for (int i = 0; i < samples; ++i) {
-        float t = (float)i / sample_rate;
-        float value = 0.5f + 0.5f * sinf(2.0f * PI * frequency * t);  // Generate sine wave [0,1]
-        DACout.write(value);
-        wait_us(1); // Delay to prevent overload (very simple timing)
+    if (isHonk) {
+        melody = honkMelody;
+        length = sizeof(honkMelody) / sizeof(Note);
+    } else {
+        melody = successMelody;
+        length = sizeof(successMelody) / sizeof(Note);
     }
 
-    DACout.write(0.5f);  // Reset to middle
+    for (int i = 0; i < length; ++i) {
+        play_note(melody[i].frequency, melody[i].duration);
+    }
 }
 
 
@@ -262,15 +386,10 @@ void play_tone(bool isHonk) {
 */
 void init_robot() {
     init_motor_control();
+    calibrate_sensors();
     debounceTimer.start(); 
     lastButtonState = button.read();  // Set the initial state of the button
     buttonState = lastButtonState;    // Make sure we start with the correct state
-
-    if (fs.mount() != 0) { //Mount filesystem
-        fprintf(fp, "Failed to mount SD card!\n");
-    } else {
-        fprintf(fp, "SD card mounted successfully.\n");
-    }
 }
 
 int main() {
@@ -296,7 +415,6 @@ int main() {
                 stop();
                 red = 1;
                 play_tone(true);
-                //play_sound(honk_wav);  // Play honk sound when stopped
                 currentState = FOLLOW_LINE;
                 break;
 
@@ -305,11 +423,8 @@ int main() {
                 turnAround();
                 green = 1;
                 play_tone(false);
-                //play_sound(end_of_line_wav);  // Play tone when the end of the line is reached
-                wait_us(3000000);
                 currentState = IDLE; 
                 break;
-
         }
     }
 }
